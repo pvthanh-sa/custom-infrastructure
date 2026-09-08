@@ -32,7 +32,19 @@ variable "vpc_id" {
 }
 variable "restricted_source_ips" {
   type        = list(string)
-  description = "List of CIDR blocks to allow for the security group ingress rules"
+  description = <<-EOT
+    CIDR blocks allowed to reach the listeners. A /0 is rejected outright -- see the validation.
+  EOT
+
+  validation {
+    condition     = length([for c in var.restricted_source_ips : c if can(regex("/0$", c))]) == 0
+    error_message = "restricted_source_ips must not contain a /0 (0.0.0.0/0 or ::/0). This list IS the network boundary in front of the load balancer; opening it to the internet is a decision that must be made deliberately in the module, not passed in as a value. If an ALB genuinely should be public, remove this validation in a commit that says why."
+  }
+
+  validation {
+    condition     = length(var.restricted_source_ips) > 0
+    error_message = "restricted_source_ips must not be empty. An empty list produces a security group with no ingress at all, which looks like a locked-down ALB and is actually an unreachable one -- the failure is silent until someone tries to use the service."
+  }
 }
 variable "subnet_ids" {
   type        = list(string)
