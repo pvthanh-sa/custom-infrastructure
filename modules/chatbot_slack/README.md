@@ -164,8 +164,17 @@ for example:
 
 ```terraform
 data "aws_iam_policy_document" "chatbot_read" {
+  # DescribeAlarms supports resource-level permissions: scope it to the alarms that publish to this
+  # channel. The pattern couples to the alarm name prefix; an alarm outside it would still notify but
+  # lose its rendering, silently. Check which alarms use the topic before choosing the pattern.
   statement {
-    actions   = ["cloudwatch:DescribeAlarms", "cloudwatch:GetMetricData", "cloudwatch:GetMetricWidgetImage"]
+    actions   = ["cloudwatch:DescribeAlarms"]
+    resources = ["arn:aws:cloudwatch:${var.region}:${local.account_id}:alarm:${local.prefix}-*"]
+  }
+
+  # GetMetricData and GetMetricWidgetImage have no resource-level permissions: "*" is the only form.
+  statement {
+    actions   = ["cloudwatch:GetMetricData", "cloudwatch:GetMetricWidgetImage"]
     resources = ["*"]
   }
 }
@@ -186,7 +195,8 @@ module "chatbot_slack_alert" {
 
 AWS's own notifications template (`AWS-Chatbot-NotificationsOnly-Policy`) is
 `cloudwatch:Describe*`, `Get*` and `List*`. The three actions above are the subset that rendering an
-alarm notification needs. **Prove it after changing**: put a real alarm into ALARM
+alarm notification needs: proven 2026-10-09 in a consumer (ALARM and OK into two channels, graph
+image included, no denied call in the Chatbot log). **Prove it after changing**: put a real alarm into ALARM
 (`aws cloudwatch set-alarm-state`) and confirm the message arrives. Chatbot also accepts a Slack
 channel ID without validating it against Slack. A wrong ID applies cleanly and then sends nothing,
 so a real notification is the only proof the channel works.
