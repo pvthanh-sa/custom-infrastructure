@@ -1,5 +1,19 @@
 variable "allow_cloudfront_prefix_list" {
-  description = "Enable ingress from AWS managed CloudFront global origin-facing prefix list."
+  description = <<-EOT
+    Enable ingress from the AWS-managed CloudFront global origin-facing prefix list
+    (com.amazonaws.global.cloudfront.origin-facing).
+
+    ⚠️ QUOTA: an AWS-MANAGED prefix list is charged against the 60-rules-per-security-group quota by
+    its MAX-ENTRIES WEIGHT (~55 for this list), not as one rule. A legacy gateway-endpoint prefix
+    list (com.amazonaws.<region>.s3) costs 1, which is where the wrong intuition comes from. Turning
+    this on alongside a handful of CIDR rules can therefore fail security-group CREATION outright
+    with RulesPerSecurityGroupLimitExceeded. It did exactly that on 2026-09-17.
+
+    ⚠️ NOT FOR VPC ORIGINS: if CloudFront reaches this load balancer through a VPC origin, traffic
+    arrives from a service-managed ENI with a PRIVATE address inside the origin's own subnets, never
+    from a CloudFront public origin-facing IP. This prefix list then authorises nothing while
+    consuming that quota weight. Use it only for an internet-facing origin.
+  EOT
   type        = bool
   default     = false
 }
@@ -32,8 +46,12 @@ variable "vpc_id" {
 }
 variable "restricted_source_ips" {
   type        = list(string)
+  nullable    = false
   description = <<-EOT
     CIDR blocks allowed to reach the listeners. A /0 is rejected outright -- see the validation.
+
+    May be empty ONLY if ingress_source_security_group_ids is non-empty (SG-only ingress); the
+    security group's lifecycle.precondition enforces that at least one of the two is set.
   EOT
 
   validation {
@@ -41,11 +59,59 @@ variable "restricted_source_ips" {
     error_message = "restricted_source_ips must not contain a /0 (0.0.0.0/0 or ::/0). This list IS the network boundary in front of the load balancer; opening it to the internet is a decision that must be made deliberately in the module, not passed in as a value. If an ALB genuinely should be public, remove this validation in a commit that says why."
   }
 
+  # The non-empty rule moved to a lifecycle.precondition on aws_security_group.security_group so
+  # that SG-only ingress is possible (empty CIDR list + ingress_source_security_group_ids). A
+  # variable validation cannot read another variable below Terraform 1.9, and this module supports
+  # >= 1.4. The /0 rule below stays here: it needs no cross-variable context.
+}
+variable "test_listener_source_ips" {
+  type        = list(string)
+  nullable    = false
+  description = <<-EOT
+    CIDR blocks allowed to reach the :10443 blue/green test listener.
+
+    ⚠️ BREAKING CHANGE (2026-09-22). Empty means NO :10443 ingress. It FAILS CLOSED.
+
+    It used to mean "fall back to every CIDR associated with the VPC", and that fallback was the
+    defect: a module default that grants access. Any consumer who relied on it — by never setting
+    this variable — loses test-listener ingress on upgrade and must now name the sources explicitly.
+    The listener resource itself is untouched, so CodeDeploy blue/green keeps working; only the
+    security-group ingress goes away.
+
+    Name the sources deliberately. The test listener is not an inert stub: its listener rule forwards
+    path_pattern ["*"] to the green target group, so every source allowed here can reach the whole
+    application during a deployment, with no CloudFront, WAF or edge auth in the path.
+  EOT
+  default     = []
+
   validation {
-    condition     = length(var.restricted_source_ips) > 0
-    error_message = "restricted_source_ips must not be empty. An empty list produces a security group with no ingress at all, which looks like a locked-down ALB and is actually an unreachable one -- the failure is silent until someone tries to use the service."
+    condition     = length([for c in var.test_listener_source_ips : c if can(regex("/0$", c))]) == 0
+    error_message = "test_listener_source_ips must not contain a /0. This port reaches the full application during a blue/green shift."
   }
 }
+
+variable "ingress_source_security_group_ids" {
+  type        = list(string)
+  nullable    = false
+  description = <<-EOT
+    Security groups allowed to reach the production :443 listener, in addition to
+    restricted_source_ips. Use this for in-VPC callers whose address is not stable or not worth
+    expressing as a CIDR (e.g. Fargate tasks in another subnet calling this ALB server-side).
+
+    This exists because the security group above declares IN-LINE ingress/egress blocks, and the
+    AWS provider does NOT support mixing those with standalone aws_security_group_rule resources:
+    an apply of the in-line set silently strips anything a standalone rule added, and the next
+    plan re-adds it, forever. Any SG-sourced ingress therefore has to be declared here, inside
+    the same resource.
+  EOT
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.ingress_source_security_group_ids : can(regex("^sg-[0-9a-f]{8,}$", id))])
+    error_message = "ingress_source_security_group_ids must contain security group IDs (sg-...), not names or ARNs."
+  }
+}
+
 variable "subnet_ids" {
   type        = list(string)
   description = "List of subnet IDs where the ALB will be deployed"
@@ -60,6 +126,36 @@ variable "enable_test_listener" {
   type        = bool
   description = "Create the :10443 test listener + the 10443/ICMP SG ingress (ECS blue-green test path). Set false for a single-target ALB that only needs 443 (reduces attack surface)."
   default     = true
+}
+
+variable "idle_timeout" {
+  type        = number
+  description = <<-EOT
+    Seconds the ALB keeps an idle BACKEND connection (ALB -> target) before closing it. 60 is the
+    AWS default; it is set explicitly here so callers can read it without querying AWS.
+
+    ⚠️ This value is a CONTRACT WITH THE APPLICATION, not just a tuning knob. An ALB pools and
+    reuses backend connections. If the target closes an idle connection FIRST, the ALB can send a
+    request onto a socket the target has already closed and returns 502 to the client — intermittent,
+    hard to reproduce, and not tied to any endpoint. The target must therefore always outlive the ALB:
+
+        headersTimeout  >  keepAliveTimeout  >  idle_timeout
+
+    Node's defaults (keepAliveTimeout 5s, headersTimeout 60s) are BELOW 60, so a Node service behind
+    this module hits that race unless it is configured. For idle_timeout = N seconds, set the Node
+    http.Server to keepAliveTimeout = (N + 5) * 1000 and headersTimeout = (N + 6) * 1000 — at the
+    default 60 that is 65_000 and 66_000.
+
+    Raise this for slow backends and recompute the app values. Do NOT lower it below the app's
+    keep-alive to "fix" the ordering: that cuts off any request slower than the timeout (504) and
+    destroys connection reuse. Raise the app above the ALB, never drop the ALB below the app.
+  EOT
+  default     = 60
+
+  validation {
+    condition     = var.idle_timeout >= 1 && var.idle_timeout <= 4000
+    error_message = "idle_timeout must be between 1 and 4000 seconds (AWS limit for an Application Load Balancer)."
+  }
 }
 
 variable "access_logs_bucket" {

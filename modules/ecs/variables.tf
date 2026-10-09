@@ -59,6 +59,61 @@ variable "task_memory_size" {}
 variable "app_health_check_path" {}
 variable "repository_url" {}
 
+variable "bootstrap_image_tag" {
+  type        = string
+  nullable    = false
+  description = <<-EOT
+    Image tag of the BOOTSTRAP task definition only. CI/CD registers the real revisions (full-SHA
+    tags) and the service ignores task_definition changes, so this tag is used only when the service
+    is first created and by the S3 appspec this stack writes. A tag that is never pushed (e.g.
+    "bootstrap") makes that state explicit: tasks fail with CannotPullContainerError until CI deploys.
+    No default and "latest" is rejected: a mutable tag makes "what would run" unanswerable.
+  EOT
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$", var.bootstrap_image_tag)) && var.bootstrap_image_tag != "latest"
+    error_message = "bootstrap_image_tag must be a valid image tag (1-128 of [A-Za-z0-9._-], not starting with . or -) and must not be \"latest\"."
+  }
+}
+
+variable "deregistration_delay" {
+  type        = number
+  description = <<-EOT
+    Seconds the ALB keeps a deregistering target in "draining" (no new requests, in-flight requests
+    allowed to finish) before ECS sends SIGTERM. Defaults to 300 — the AWS default — so other
+    consumers keep today's behaviour on upgrade.
+
+    Size it against the load balancer's idle timeout, not against the app's shutdown: once draining
+    ends, ECS sends SIGTERM and the app's own graceful shutdown (bounded by the container stopTimeout)
+    handles whatever is left. A value at or just above the ALB idle timeout lets the ALB close every
+    keepalive connection it holds before the task is signalled; anything far above it only slows
+    scale-in and the end of a blue/green deployment.
+  EOT
+  default     = 300
+  nullable    = false
+
+  validation {
+    condition     = var.deregistration_delay >= 0 && var.deregistration_delay <= 3600
+    error_message = "deregistration_delay must be between 0 and 3600 seconds (the ALB limit)."
+  }
+}
+variable "enable_execute_command" {
+  type        = bool
+  description = <<-EOT
+    Turn on ECS Exec for the service's tasks. Defaults to true so existing consumers keep today's
+    behaviour on upgrade.
+
+    Turn it OFF where it buys nothing: with a read-only root filesystem there is little to do inside
+    the container, and an exec session is an interactive way in that is not session-logged unless the
+    cluster has executeCommandConfiguration logging set up.
+
+    With a CODE_DEPLOY deployment controller the flag changes on the service without starting a
+    deployment, and takes effect for tasks started AFTER it — i.e. from the next CodeDeploy deployment.
+    Tasks already running keep their current setting until they are replaced.
+  EOT
+  default     = true
+  nullable    = false
+}
 variable "assign_public_ip" {
   type        = bool
   description = "Assign public IP to ECS tasks (required when running in public subnets without NAT Gateway)"

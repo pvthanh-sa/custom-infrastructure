@@ -66,12 +66,28 @@ data "aws_iam_policy_document" "ecs_task_execution_policy_document" {
 data "aws_iam_policy_document" "ecs_task" {
   # source_policy_documents = [data.aws_iam_policy.ecs_task_role_policy.policy]
 
-  # SSM and KMS permissions for ECS Exec
+  # ECS Exec session channels.
+  #
+  # These four actions MUST stay on Resource "*": the SSM Messages API defines no resource-level
+  # permissions for them, so any ARN here would deny every session. Do not "tighten" this — the
+  # scoping that matters was done by removing the two actions below.
+  #
+  # REMOVED 2026-09-18 (G4 High finding):
+  #   - ssm:GetParameters — nothing in this stack reads SSM Parameter Store. Runtime secrets come
+  #     from Secrets Manager, pulled by the EXECUTION role via the task definition's `secrets`
+  #     block, not by the TASK role. On Resource "*" it granted every parameter in an account
+  #     shared with the WMS project.
+  #   - kms:Decrypt — only required when ECS Exec session encryption is configured with a CMK
+  #     (cluster `executeCommandConfiguration.kmsKeyId`). Verified 2026-09-18: neither cluster sets
+  #     executeCommandConfiguration at all, so sessions use the AWS-managed default and the task
+  #     role needs no KMS grant. On Resource "*" it unlocked every SecureString the line above
+  #     could read.
+  # If Exec session encryption is ever enabled with a CMK, re-add kms:Decrypt scoped to THAT key
+  # ARN with a kms:ViaService condition — never back to "*".
   statement {
+    sid    = "ECSExecSessionChannels"
     effect = "Allow"
     actions = [
-      "ssm:GetParameters",
-      "kms:Decrypt",
       "ssmmessages:CreateDataChannel",
       "ssmmessages:OpenDataChannel",
       "ssmmessages:OpenControlChannel",

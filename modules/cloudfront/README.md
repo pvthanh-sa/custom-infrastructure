@@ -2,6 +2,61 @@
 
 Terraform module which creates CloudFront distribution with ALB origin on AWS.
 
+> ## 🚨 UPGRADE NOTE — 2026-09-24. A required variable, and a raised Terraform floor.
+>
+> ### 1. `cache_key_headers` is MANDATORY — unless you pin `cache_policy_id`
+>
+> `forwarded_headers` fed **both** the cache policy and the origin-request policy, which want
+> opposite values, so every caller was wrong in one direction:
+>
+> - Include `Authorization` (which this README used to instruct API callers to do) and the bearer
+>   token entered the **cache key**. Every token got its own entry, so the cache bought nothing, and
+>   an authenticated response was then served from the edge for up to `max_ttl` — **one year by
+>   default** — after the token was revoked.
+> - Omit it and `Authorization` never reached the origin, while per-user responses were cached and
+>   served **across** users.
+>
+> It is now split: `cache_key_headers` (the cache key) and `origin_request_headers` (forwarding to
+> the origin, default `null` → `allViewer`). `forwarded_headers` still works as a **deprecated alias
+> that maps to `origin_request_headers` ONLY** — never the cache key. Headers keep reaching your
+> origin so nothing functional breaks; they stop entering the cache key, which was the vulnerability.
+> Expect **one cold cache**.
+>
+> **`cache_key_headers` has no default and a `lifecycle.precondition` will stop your plan until you
+> set it.** That is deliberate: a consumer who never touched `forwarded_headers` was *also* keying on
+> five headers, so gating on `forwarded_headers` would have missed exactly the people who never read
+> this note. No default can preserve everyone's behaviour, because the old variable did two jobs.
+> To reproduce the old cache key exactly:
+>
+> ```hcl
+> cache_key_headers = ["Host", "CloudFront-Forwarded-Proto", "CloudFront-Is-Desktop-Viewer",
+>                      "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-Tablet-Viewer"]
+> ```
+>
+> `[]` is usually the right answer. **Never put a credential there.** If you pass `cache_policy_id`
+> (e.g. the managed `CachingDisabled`), this module builds no cache policy and never asks you.
+>
+> ### 2. `required_version` is now `>= 1.4.0`
+>
+> This corrects a **pre-existing** declaration, not a new requirement: `variables.tf` has used the
+> two-argument `optional(string, "")` form — which needs Terraform >= 1.3 — since well before this
+> change, while the module declared `>= 1.0`. A caller on 1.0–1.2 got an HCL **parse error**, not a
+> version error. 1.4.0 is this library's common floor.
+>
+> ### ⚠️ STILL OPEN — do not assume this area is finished
+>
+> The fix above covers *which headers* enter the cache key. Two neighbouring defects are **untouched**:
+>
+> - **`cookie_behavior = "all"` is hardcoded INTO THE CACHE KEY** and no variable exists to change
+>   it. A session cookie is a credential: every session gets its own entries (so the cache does
+>   nothing), and an authenticated response lives at the edge for that cookie value up to `max_ttl`,
+>   surviving logout. Same shape as the `Authorization` defect, one door over.
+> - **`default_ttl = 300` with `max_ttl = 31536000`** (one year) on a module that may front an API.
+>   The split removes the credential-keyed entry; it does not shorten how long a correctly-keyed one
+>   lives.
+>
+> Both change behaviour for every consumer and are held for their own decision.
+
 > ⚠️ **MANDATORY — Origin mTLS for any origin you control.** When this distribution fronts an origin
 > you own (ALB / custom origin), you **MUST** set `origin_client_certificate_arn` so CloudFront
 > presents a client certificate that the origin verifies. A CloudFront **prefix list** or a
@@ -100,14 +155,15 @@ module "cloudfront" {
   default_ttl = 300
   max_ttl     = 86400
 
-  # Custom headers to forward
-  forwarded_headers = [
-    "Host",
-    "CloudFront-Forwarded-Proto",
+  # Cache key: keep it short, never a credential. There is NO default — [] means "none".
+  cache_key_headers = [
     "CloudFront-Is-Desktop-Viewer",
     "CloudFront-Is-Mobile-Viewer",
-    "CloudFront-Is-Tablet-Viewer"
+    "CloudFront-Is-Tablet-Viewer",
   ]
+
+  # Origin forwarding: unset = allViewer, which already includes Authorization.
+  # origin_request_headers = null
 
   # Additional cache behaviors
   cache_behaviors = [
@@ -242,7 +298,9 @@ module "cloudfront_api" {
 | acm_certificate_arn       | ACM certificate ARN (must be in us-east-1) | `string`       | `""`               |    no    |
 | origin_client_certificate_arn | Origin mTLS: ACM client-cert ARN (us-east-1, EKU clientAuth) CloudFront presents to the origin. `""` disables. Needs aws >= 6.51.0 | `string` | `""`     |    no    |
 | route_53_zone_id          | Route 53 hosted zone ID                    | `string`       | `""`               |    no    |
-| forwarded_headers         | Headers to forward to origin               | `list(string)` | Default headers    |    no    |
+| cache_key_headers         | Headers in the CACHE KEY (never a credential) | `list(string)` | **none — required** |   yes    |
+| origin_request_headers    | Headers forwarded TO THE ORIGIN            | `list(string)` | `null` (allViewer) |    no    |
+| forwarded_headers         | **DEPRECATED** — alias for origin_request_headers | `list(string)` | `null`     |    no    |
 | min_ttl                   | Minimum TTL for cache                      | `number`       | `0`                |    no    |
 | default_ttl               | Default TTL for cache                      | `number`       | `300`              |    no    |
 | max_ttl                   | Maximum TTL for cache                      | `number`       | `31536000`         |    no    |
@@ -270,51 +328,85 @@ module "cloudfront_api" {
 | cloudfront_function_arn     | ARN of the CloudFront Function             |
 | access_urls                 | Map of available access URLs               |
 
-## Important: Forwarded Headers Configuration
+## Headers: cache key vs origin forwarding
 
-When using CloudFront with an API backend, you **must** configure `forwarded_headers` properly to ensure your application works correctly.
+These are **two different questions** and they want opposite answers. The module used to ask them
+with one variable, `forwarded_headers`, which meant every caller was wrong in one direction:
 
-### For API Servers (NestJS, Express, etc.)
+- Put `Authorization` in it — as an earlier version of this README instructed — and the bearer token
+  entered the **cache key**. Every token got its own cache entry, so the cache bought nothing, and
+  an authenticated response was then served from the edge for up to `max_ttl` (one year by default)
+  after the token was revoked or the data changed.
+- Leave it out and `Authorization` **never reached the origin**, while responses that vary per user
+  were cached and served **across** users.
+
+So the variable was split.
+
+| Variable | Feeds | Default | Rule of thumb |
+| --- | --- | --- | --- |
+| `cache_key_headers` | the **cache key** | **none — you must set it** | as SHORT as possible. **Never a credential.** `[]` is usually right. |
+| `origin_request_headers` | what **reaches the origin** | `null` → `allViewer` | leave it alone unless you mean to withhold something |
+
+### Where does `Authorization` go?
+
+**`origin_request_headers`, never `cache_key_headers`** — and with the default (`null` → `allViewer`)
+you do not need to name it at all. It already reaches the origin.
+
+Putting a credential in the cache key is not a tuning mistake, it is a data-leak shape: responses
+keyed by token, served from the edge long after the token stops being valid.
+
+### ⚠️ Upgrading across the split: `cache_key_headers` has NO default
+
+It is deliberately required. Before the split this module keyed the cache on five headers by
+default; if `cache_key_headers` defaulted to `[]` an upgrade would silently NARROW every existing
+consumer's cache key to `none`. A `lifecycle.precondition` on the cache policy fails at **plan**
+until you choose:
 
 ```terraform
-forwarded_headers = [
-  "Host",                           # Server knows which domain is being requested
-  "Authorization",                  # JWT/Bearer token authentication (CRITICAL!)
-  "CloudFront-Forwarded-Proto",     # Server knows HTTPS or HTTP
-  "CloudFront-Is-Desktop-Viewer",   # Device detection
-  "CloudFront-Is-Mobile-Viewer",    # Device detection
-  "CloudFront-Is-Tablet-Viewer",    # Device detection
-  "Origin",                         # CORS - which domain is making the request
-  "Access-Control-Request-Headers", # CORS preflight requests
-  "Access-Control-Request-Method",  # CORS preflight requests
-]
+cache_key_headers = []                      # no header in the key — usually right
+# or, to reproduce the pre-split behaviour exactly:
+cache_key_headers = ["Host", "CloudFront-Forwarded-Proto", "CloudFront-Is-Desktop-Viewer",
+                     "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-Tablet-Viewer"]
 ```
 
-### For Web Applications (Vue, React, Angular SSR)
+A caller passing `cache_policy_id` skips the module's cache policy entirely and is never asked.
+
+### API server (NestJS, Express, …)
 
 ```terraform
-forwarded_headers = [
-  "Host",
-  "CloudFront-Forwarded-Proto",
+cache_key_headers = [] # decide explicitly; an API keys on nothing
+# Otherwise nothing to configure. allViewer forwards Authorization, Origin,
+# Access-Control-Request-*, Content-Type and the rest; the cache key stays empty.
+# If the API must never be cached, pass the AWS-managed CachingDisabled policy instead:
+#   cache_policy_id = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+```
+
+### Web application (Nuxt/Next SSR)
+
+```terraform
+# Only if the server renders DIFFERENT HTML per device class. If it ships responsive CSS and the
+# HTML is identical, leave this empty — these headers would triple the cache entries for nothing.
+cache_key_headers = [
   "CloudFront-Is-Desktop-Viewer",
   "CloudFront-Is-Mobile-Viewer",
   "CloudFront-Is-Tablet-Viewer",
 ]
+# origin_request_headers: leave unset (allViewer).
 ```
 
-### Header Reference
+Note what is **not** in that list. `Host` is constant on a single-alias distribution and
+`CloudFront-Forwarded-Proto` is constant when the viewer policy is `redirect-to-https`; a constant
+header in a cache key fragments nothing and buys nothing.
 
-| Header                       | Purpose                                 | When to use                    |
-| ---------------------------- | --------------------------------------- | ------------------------------ |
-| `Host`                       | Server knows the domain being requested | Always                         |
-| `Authorization`              | JWT/Bearer token authentication         | **API servers with auth**      |
-| `CloudFront-Forwarded-Proto` | Server knows if HTTPS or HTTP           | Redirect logic, secure cookies |
-| `CloudFront-Is-*-Viewer`     | Device type detection                   | Responsive logic on server     |
-| `Origin`                     | CORS - origin domain of request         | API servers with CORS          |
-| `Access-Control-Request-*`   | CORS preflight requests                 | API servers with CORS          |
-| `x-strapi-signature`         | Strapi webhook verification             | Strapi CMS only                |
+### `forwarded_headers` is DEPRECATED
 
-> ⚠️ **Warning:** Without `Authorization` header forwarding, your API authentication (JWT tokens) will NOT work through CloudFront!
+It still works and now maps to **`origin_request_headers` only** — never to the cache key. Headers
+keep reaching your origin, so nothing functional breaks; they stop entering the cache key, which was
+the vulnerability. Expect **one cold cache** after upgrading. Its default also changed from a
+five-header list to `null`, so a caller who sets nothing now gets `allViewer` instead of a whitelist
+that silently dropped `Authorization`.
+
+It is deliberately **not** mapped to both variables: that would preserve the defect under a new name.
 
 ## Requirements
 

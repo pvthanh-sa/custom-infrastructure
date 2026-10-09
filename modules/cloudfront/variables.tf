@@ -45,10 +45,72 @@ variable "response_headers_policy_id" {
   default     = ""
 }
 
-variable "forwarded_headers" {
-  description = "List of headers to forward to origin"
+variable "cache_key_headers" {
+  description = <<-EOT
+    Headers that become part of the CACHE KEY. There is NO default — you must choose, once.
+
+    `[]` means header_behavior "none" (no header in the key). That is usually right. It is not the
+    default because an upgrade from the pre-split module would then silently NARROW the cache key:
+    before the split this module keyed on five headers, and a consumer who says nothing must not
+    drift from that by accident. Set it deliberately, then it is yours.
+
+    To reproduce the pre-split behaviour exactly:
+      cache_key_headers = ["Host", "CloudFront-Forwarded-Proto", "CloudFront-Is-Desktop-Viewer",
+                           "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-Tablet-Viewer"]
+    though most of those are constant on a single-alias, redirect-to-https distribution and buy
+    nothing in a cache key.
+
+    Keep this as SHORT as possible. Every header here multiplies the number of cache entries, and a
+    header whose value is effectively constant (Host on a single-alias distribution,
+    CloudFront-Forwarded-Proto when the viewer policy is redirect-to-https) adds fragmentation for
+    nothing. NEVER put a credential here — Authorization, Cookie, or any per-user token — see
+    origin_request_headers.
+  EOT
   type        = list(string)
-  default     = ["Host", "CloudFront-Forwarded-Proto", "CloudFront-Is-Desktop-Viewer", "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-Tablet-Viewer"]
+  default     = null
+}
+
+variable "origin_request_headers" {
+  description = <<-EOT
+    Headers FORWARDED TO THE ORIGIN. Default null -> header_behavior "allViewer" (every viewer
+    header reaches the origin). This is where Authorization belongs.
+
+    Set an explicit list only to withhold headers from the origin on purpose. A short list here is
+    the dangerous direction: a header the origin needs and does not receive fails at runtime with
+    nothing in the infrastructure to point at — which is exactly how this module used to drop
+    Authorization.
+  EOT
+  type        = list(string)
+  default     = null
+}
+
+variable "forwarded_headers" {
+  description = <<-EOT
+    DEPRECATED (2026-09-23) — use cache_key_headers and origin_request_headers.
+
+    This one variable used to feed BOTH the cache policy and the origin request policy, which want
+    OPPOSITE values, so every caller was wrong in one direction or the other:
+
+      · Include Authorization (which this module's own README instructed API callers to do) and the
+        bearer token entered the CACHE KEY. Each token got its own cache entry, so the cache bought
+        nothing, and an authenticated response was then served from the edge for up to max_ttl —
+        one year by default — after the token was revoked or the data changed.
+      · Omit it and Authorization never reached the origin at all, while per-user responses were
+        cached and served ACROSS users.
+
+    No single list can be correct for both a cache key and origin forwarding, which is why this was
+    split rather than re-tuned.
+
+    When set, it now maps to origin_request_headers ONLY — never to the cache key. That direction is
+    deliberate: headers keep reaching the origin so nothing functional breaks, and they stop
+    entering the cache key, which was the vulnerability. Existing consumers pay one cold cache.
+    Mapping it to both "for backward compatibility" would preserve the defect under a new name.
+
+    The default also changed, from a five-header list to null, so that a caller who sets nothing now
+    gets allViewer forwarding instead of a whitelist that silently dropped Authorization.
+  EOT
+  type        = list(string)
+  default     = null
 }
 
 variable "min_ttl" {
@@ -89,7 +151,10 @@ variable "cache_behaviors" {
   #     allowed_methods            = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
   #     cached_methods             = ["GET", "HEAD"]
   #     cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # CachingDisabled
-  #     origin_request_policy_id   = "216adef6-5c7f-47e4-b989-5492eafa07d3" # AllViewerExceptHost
+  #     origin_request_policy_id   = "216adef6-5c7f-47e4-b989-5492eafa07d3" # Managed-AllViewer
+  #     # NOTE: 216adef6 is Managed-AllViewer (forwards ALL viewer headers, including Host).
+  #     # AllViewerExceptHostHeader is b689b0a8-53d0-40ab-baf2-68738e2966ac. Verified against
+  #     # `aws cloudfront get-origin-request-policy` 2026-09-17; the old label here was wrong.
   #     response_headers_policy_id = ""
   #     enable_auth                = false
   #   },
