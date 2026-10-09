@@ -155,6 +155,12 @@ resource "aws_lb" "alb" {
   subnets         = var.subnet_ids
   internal        = var.alb_internal
 
+  # Backend (ALB -> target) idle timeout. Explicit at the AWS default so it is readable from code.
+  # It is a contract with the application: a Node target MUST hold connections longer than this
+  # (keepAliveTimeout = idle_timeout + 5s, headersTimeout = +6s) or the ALB reuses a socket the
+  # target already closed and returns an intermittent 502. See var.idle_timeout.
+  idle_timeout = var.idle_timeout
+
   drop_invalid_header_fields = true
 
   dynamic "access_logs" {

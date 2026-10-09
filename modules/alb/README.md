@@ -157,6 +157,53 @@ module "alb_with_cloudfront" {
 | `alb_internal = true`  | Internal ALB accessible only within VPC | Backend APIs, microservices |
 | `alb_internal = false` | Internet-facing ALB publicly accessible | Public websites, APIs       |
 
+## Idle timeout — and the 502 it causes if the app is not configured
+
+`idle_timeout` defaults to **60** (the AWS default), set explicitly so it is readable from code
+instead of requiring an AWS lookup.
+
+It is a **contract with the application**, not only a tuning knob. The ALB pools and reuses backend
+connections. If the target closes an idle connection first, the ALB can put a request onto a socket
+the target already closed and return **502** — intermittent, not tied to any endpoint, and usually
+seen after a user idles for tens of seconds and then acts again.
+
+The target must always outlive the ALB:
+
+```
+headersTimeout  >  keepAliveTimeout  >  idle_timeout
+```
+
+| `idle_timeout` | Node `keepAliveTimeout` | Node `headersTimeout` |
+| -------------- | ----------------------- | --------------------- |
+| 60 (default)   | 65_000                  | 66_000                |
+| 120            | 125_000                 | 126_000               |
+| N              | (N + 5) × 1000          | (N + 6) × 1000        |
+
+Node's own defaults — `keepAliveTimeout` 5 s, `headersTimeout` 60 s — are **below** 60, so a Node
+service behind this module hits the race unless it sets both on the underlying `http.Server`.
+Express/Nest expose that server directly; Nitro (Nuxt) does not, so reaching it there takes a build
+step — and in either case **log the effective `keepAliveTimeout` at startup**, because a hook that
+silently failed to attach looks identical to one that worked.
+
+### Keep the app's env in step with this value
+
+Do not hardcode 65_000 / 66_000 in the app. Pass the ALB value to the container and let the app
+derive both timeouts from it, so the two sides can only change together:
+
+| App | Env var (in the task definition) | App computes |
+| --- | -------------------------------- | ------------ |
+| NestJS / Express | `ALB_IDLE_TIMEOUT_SECONDS` | `keepAliveTimeout = (N + 5) s`, `headersTimeout = (N + 6) s` |
+| Nuxt (Nitro) | `NUXT_ALB_IDLE_TIMEOUT_SECONDS` (`NUXT_` prefix = Nuxt runtime config) | same |
+
+**The env value MUST equal `idle_timeout`.** The task definition is usually registered by CI/CD
+from the app repository, not by Terraform, so nothing links the two automatically: when you change
+`idle_timeout`, change the env var in the app's task definition in the same release — and raise the
+app side first, then the ALB.
+
+Do **not** lower `idle_timeout` below the app's keep-alive to fix the ordering. That cuts off every
+request slower than the timeout (504) and destroys connection reuse. Raise the app above the ALB,
+never drop the ALB below the app.
+
 ## Security Configuration Options
 
 | Option                                   | Description                                |
@@ -232,6 +279,7 @@ That is enforced by a `lifecycle.precondition`, so it fails at plan, not at appl
 | `test_listener_source_ips` | CIDRs allowed on the :10443 blue/green test listener. **`[]` = no ingress (fail closed)** — see the BREAKING CHANGE section. | `list(string)` | `[]` | no |
 | `enable_test_listener` | Create the :10443 test listener at all. Keep `true` for blue/green — CodeDeploy references its ARN. | `bool` | `true` | no |
 | `ssl_policy` | TLS policy for the HTTPS listeners. Must be TLS 1.2+; legacy policies are rejected. | `string` | `ELBSecurityPolicy-TLS13-1-2-2021-06` | no |
+| `idle_timeout` | Backend (ALB → target) idle timeout in seconds, 1–4000. A contract with the app — see "Idle timeout". | `number` | `60` | no |
 | `access_logs_bucket` | S3 bucket for ALB access logs. Empty = disabled. | `string` | `""` | no |
 ## Outputs
 

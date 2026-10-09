@@ -128,6 +128,36 @@ variable "enable_test_listener" {
   default     = true
 }
 
+variable "idle_timeout" {
+  type        = number
+  description = <<-EOT
+    Seconds the ALB keeps an idle BACKEND connection (ALB -> target) before closing it. 60 is the
+    AWS default; it is set explicitly here so callers can read it without querying AWS.
+
+    ⚠️ This value is a CONTRACT WITH THE APPLICATION, not just a tuning knob. An ALB pools and
+    reuses backend connections. If the target closes an idle connection FIRST, the ALB can send a
+    request onto a socket the target has already closed and returns 502 to the client — intermittent,
+    hard to reproduce, and not tied to any endpoint. The target must therefore always outlive the ALB:
+
+        headersTimeout  >  keepAliveTimeout  >  idle_timeout
+
+    Node's defaults (keepAliveTimeout 5s, headersTimeout 60s) are BELOW 60, so a Node service behind
+    this module hits that race unless it is configured. For idle_timeout = N seconds, set the Node
+    http.Server to keepAliveTimeout = (N + 5) * 1000 and headersTimeout = (N + 6) * 1000 — at the
+    default 60 that is 65_000 and 66_000.
+
+    Raise this for slow backends and recompute the app values. Do NOT lower it below the app's
+    keep-alive to "fix" the ordering: that cuts off any request slower than the timeout (504) and
+    destroys connection reuse. Raise the app above the ALB, never drop the ALB below the app.
+  EOT
+  default     = 60
+
+  validation {
+    condition     = var.idle_timeout >= 1 && var.idle_timeout <= 4000
+    error_message = "idle_timeout must be between 1 and 4000 seconds (AWS limit for an Application Load Balancer)."
+  }
+}
+
 variable "access_logs_bucket" {
   type        = string
   description = "S3 bucket name for ALB access logs. Empty = access logging disabled. The bucket must allow the regional ELB log-delivery principal to write."
