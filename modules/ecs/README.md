@@ -355,6 +355,16 @@ behaviour), validated 0–3600. Size it against the ALB `idle_timeout`: a value 
 lets the ALB close every keep-alive connection it holds before ECS sends SIGTERM, so 60 is a good
 choice behind an ALB at the default idle timeout of 60.
 
+## ALB → task ingress survives an ALB security-group replacement
+
+`aws_security_group_rule.ecs_allow_alb` (task SG ingress on the container port, source = the ALB
+SG) is replaced whenever the ALB security group is. It uses `create_before_destroy`, so the new rule
+exists before the old one is deleted. With the default destroy-before-create the tasks had no ALB
+ingress for ~3 s per service (measured on a real replacement), and every NEW ALB → task connection
+in that window got a 504. Remaining limit: Terraform does not order the old rule's deletion after the
+ALB's `SetSecurityGroups`; both run right after the new SG exists, so a residual gap is possible only
+if the ALB applies its new SG later than the old rule is removed.
+
 ## Required Variables
 
 | Variable | Type | Description |
