@@ -2,6 +2,20 @@
 
 Terraform module which creates CloudFront distribution with ALB origin on AWS.
 
+> ## UPGRADE NOTE — 2026-10-09. Three behaviour fixes, no new inputs.
+>
+> 1. **`enable_ipv6` now turns IPv6 on.** The distribution never set `is_ipv6_enabled`, so it took
+>    the provider default `false` while `enable_ipv6` (default `true`) still published the AAAA
+>    alias. Consumers on the default will see an in-place `is_ipv6_enabled: false -> true` in their
+>    next plan. Set `enable_ipv6 = false` to keep IPv6 off; that also drops the AAAA record.
+> 2. **Basic auth no longer forwards the credential.** The function now deletes `Authorization`
+>    after checking it, so the origin never receives the shared basic-auth password. An origin
+>    that read `Authorization` on a basic-auth-gated behaviour will stop seeing it. That includes
+>    a Bearer scheme, which could never coexist with basic auth on the same request anyway. See
+>    [Where does `Authorization` go?](#where-does-authorization-go).
+> 3. **The VPC origin is `create_before_destroy`.** No plan change for existing stacks. See
+>    [VPC origin replacement](#vpc-origin-replacement) for what it does and does not protect.
+
 > ## 🚨 UPGRADE NOTE — 2026-09-24. A required variable, and a raised Terraform floor.
 >
 > ### 1. `cache_key_headers` is MANDATORY — unless you pin `cache_policy_id`
@@ -309,7 +323,7 @@ module "cloudfront_api" {
 | geo_restriction_locations | Country codes for restrictions             | `list(string)` | `[]`               |    no    |
 | price_class               | CloudFront price class                     | `string`       | `"PriceClass_All"` |    no    |
 | enable_logging            | Enable access logging                      | `bool`         | `false`            |    no    |
-| enable_ipv6               | Enable IPv6 support                        | `bool`         | `true`             |    no    |
+| enable_ipv6               | IPv6 on the distribution (`is_ipv6_enabled`) and the AAAA alias | `bool` | `true`   |    no    |
 | enable_default_auth       | Enable basic authentication                | `bool`         | `false`            |    no    |
 | basic_auth_username       | Username for basic auth                    | `string`       | `"admin"`          |    no    |
 | basic_auth_password       | Password for basic auth                    | `string`       | `""`               |    no    |
@@ -354,6 +368,13 @@ you do not need to name it at all. It already reaches the origin.
 
 Putting a credential in the cache key is not a tuning mistake, it is a data-leak shape: responses
 keyed by token, served from the edge long after the token stops being valid.
+
+**Behind basic auth, `Authorization` never reaches the origin.** On a behaviour with basic auth
+enabled (`enable_default_auth`, or `enable_auth` on a cache behaviour), the viewer's `Authorization`
+header *is* the basic-auth credential. The function checks it and then deletes it, so the origin
+sees no `Authorization` at all. An application that needs its own `Authorization` scheme (for
+example Bearer) cannot share a behaviour with basic auth. It would need the gate removed, or a
+different header.
 
 ### ⚠️ Upgrading across the split: `cache_key_headers` has NO default
 
@@ -407,6 +428,30 @@ five-header list to `null`, so a caller who sets nothing now gets `allViewer` in
 that silently dropped `Authorization`.
 
 It is deliberately **not** mapped to both variables: that would preserve the defect under a new name.
+
+## VPC origin replacement
+
+`aws_cloudfront_vpc_origin` is `create_before_destroy`. AWS creates a service-managed security
+group, `CloudFront-VPCOrigins-Service-SG`, the first time a VPC origin is created in a VPC. AWS also
+**deletes** that group when the last VPC origin in the VPC is deleted. Consumers that allow
+CloudFront into their ALB by looking that group up by name (`data "aws_security_group"`) depend
+on it existing. With destroy-first, replacing the only VPC origin in a VPC would remove the group
+mid-apply.
+
+What this does **not** cover. These limits are real, so read them before relying on it:
+
+- **It narrows the window. It does not decouple the lookup from the resource.** If the last VPC
+  origin in the VPC is ever removed rather than replaced (for example `enable_vpc_origin = false`,
+  or a destroy), AWS deletes the service SG. Any `data` lookup of it then fails at **plan** time,
+  whatever this lifecycle says.
+- **It propagates to dependencies.** Terraform applies `create_before_destroy` to everything this
+  resource depends on, which in practice is the ALB whose ARN it carries. An ALB with a fixed `name`
+  that ever has to be **replaced** would then try to create its successor under the same name and
+  fail. In-place ALB changes are unaffected.
+- **Duplicate VPC origins are unverified.** `CreateVpcOrigin` documents `EntityAlreadyExists` but
+  not which field must be unique. If AWS refuses a second VPC origin with the same name or origin ARN
+  while the old one exists, the replacement fails at the create step. The old origin and the
+  service SG are left intact, so nothing is lost, but the apply does not complete.
 
 ## Requirements
 

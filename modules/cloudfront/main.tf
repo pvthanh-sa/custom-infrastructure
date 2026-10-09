@@ -29,7 +29,13 @@ resource "aws_cloudfront_vpc_origin" "main" {
     }
   }
 
+  # Replace by creating the new VPC origin first. AWS deletes the account's
+  # CloudFront-VPCOrigins-Service-SG when the LAST VPC origin in a VPC is deleted, and consumers
+  # commonly look that SG up by name; destroy-first would remove it mid-apply. This narrows the
+  # window only -- see README "VPC origin replacement" for what it does not cover.
   lifecycle {
+    create_before_destroy = true
+
     precondition {
       condition     = var.vpc_origin_endpoint_arn != ""
       error_message = "vpc_origin_endpoint_arn is required when enable_vpc_origin = true."
@@ -45,6 +51,10 @@ resource "aws_cloudfront_vpc_origin" "main" {
 }
 
 resource "aws_cloudfront_distribution" "main" {
+
+  # Without this the distribution takes the provider default (false) while enable_ipv6 still
+  # publishes the AAAA alias below, so IPv6 clients resolved an address CloudFront would not serve.
+  is_ipv6_enabled = var.enable_ipv6
 
   origin {
     domain_name = var.alb_domain_name

@@ -48,3 +48,46 @@ variable "allow_eventbridge_publish" {
   type        = bool
   default     = false
 }
+
+variable "read_policy_arn" {
+  description = <<-EOT
+    IAM policy ARN attached to the channel role and also applied as its guardrail. This is everything
+    the channel (and anyone running @aws commands in it) can read.
+
+    The default, AWS-managed ReadOnlyAccess, keeps the module's historical behaviour. It is
+    account-wide read, including s3:GetObject on every bucket (Terraform state among them). A channel
+    that only receives notifications needs far less: AWS's own notifications template is
+    cloudwatch:Describe*/Get*/List*. Pass a narrow customer-managed policy when nobody runs commands
+    in the channel.
+  EOT
+  type        = string
+  default     = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+
+  validation {
+    condition     = can(regex("^arn:aws[a-zA-Z-]*:iam::(aws|[0-9]{12}):policy/.+$", var.read_policy_arn))
+    error_message = "read_policy_arn must be an IAM policy ARN (arn:aws:iam::<account|aws>:policy/<name>)."
+  }
+}
+
+variable "allow_lambda_invoke" {
+  description = "Allow lambda:InvokeFunction / InvokeAsync on \"*\" from the channel. Off by default: invoke-any-Lambda is rarely wanted, and in a shared account it reaches other projects' functions. BREAKING for consumers that ran @aws lambda invoke: set true to keep it."
+  type        = bool
+  default     = false
+}
+
+variable "user_authorization_required" {
+  description = "Require each Slack user to choose their own IAM user role before running commands (Chatbot UserRoleRequired). null leaves the AWS default (false)."
+  type        = bool
+  default     = null
+}
+
+variable "logging_level" {
+  description = "Chatbot logging level to CloudWatch Logs: ERROR, INFO or NONE. null leaves the AWS default (NONE)."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.logging_level == null || contains(["ERROR", "INFO", "NONE"], coalesce(var.logging_level, "NONE"))
+    error_message = "logging_level must be ERROR, INFO or NONE (or null for the AWS default)."
+  }
+}
