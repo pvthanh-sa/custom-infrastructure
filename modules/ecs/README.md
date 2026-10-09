@@ -2,6 +2,35 @@
 
 This module deploys an ECS Fargate service with Application Load Balancer (ALB) or Network Load Balancer (NLB) integration, supporting Blue/Green deployments via AWS CodeDeploy.
 
+> ## 🚨 UPGRADE NOTE — 2026-09-24. One permission removed. Check before you upgrade.
+>
+> **`ssm:GetParameters` and `kms:Decrypt` are gone from the ECS TASK role.** Both were granted on
+> `Resource "*"`, which meant every SSM parameter in the account and every key that could decrypt
+> them.
+>
+> **If your application reads SSM Parameter Store at runtime, it will start failing with
+> AccessDenied after this upgrade.** Re-attach the permission yourself, scoped to your parameters —
+> the new `ecs_task_role_name` output (below) exists so you can, without hardcoding the role name.
+>
+> Runtime secrets pulled through the task definition's `secrets` block are **not** affected: those
+> are fetched by the *execution* role, which is untouched. `kms:Decrypt` on the task role is needed
+> only when ECS Exec session encryption is configured with a CMK
+> (`executeCommandConfiguration.kmsKeyId` on the cluster). If you set that, re-add `kms:Decrypt`
+> scoped to **that key ARN** with a `kms:ViaService` condition — never back to `"*"`.
+>
+> The four `ssmmessages:*` actions stay on `Resource "*"` and must: the SSM Messages API defines no
+> resource-level permissions for them, so any ARN there denies every ECS Exec session.
+>
+> ### Also new (additive, nothing breaks)
+>
+> - **`ecs_task_role_name` output** — attach your own policies to the task role without hardcoding
+>   its name. Its absence is why an assets-bucket policy once shipped orphaned.
+> - **`desired_count` added to `lifecycle.ignore_changes`** — when an `aws_appautoscaling_target` is
+>   registered against the service, Application Auto Scaling owns the count. Without this, every
+>   apply reset the service to `var.desired_task_count`, *including mid scale-out*, removing capacity
+>   during the load event that caused it. If you do NOT use autoscaling and relied on Terraform to
+>   set the count, note that changes to `desired_task_count` no longer take effect after creation.
+
 ## Features
 
 - ✅ ECS Fargate tasks with customizable CPU/Memory
@@ -237,6 +266,48 @@ module "ecs_server" {
 ```
 
 ---
+
+## ⚠️ BREAKING CHANGE — the task role no longer grants `ssm:GetParameters` or `kms:Decrypt`
+
+**Before:** `data.aws_iam_policy_document.ecs_task` granted `ssm:GetParameters`, `kms:Decrypt` and
+four `ssmmessages:*` actions, all on `Resource: "*"`.
+
+**Now:** only the four `ssmmessages:*` ECS Exec channel actions remain, still on `"*"` — the SSM
+Messages API defines no resource-level permissions for them, so any ARN there would deny every
+session. That wildcard is required, not an oversight; do not "tighten" it.
+
+**What a consumer must do:** if your task code reads SSM Parameter Store or calls `kms:Decrypt`
+directly, it will now get AccessDenied. Attach those permissions yourself, scoped to the parameters
+and keys you actually use — `ecs_task_role_name` (below) exists so you can.
+
+**Why:** on `Resource: "*"` those two actions let any code execution inside a container read **every**
+SSM parameter in the account, SecureStrings included, because `kms:Decrypt` on `*` covers the keys
+protecting them. `kms:Decrypt` is only genuinely needed when ECS Exec session encryption is
+configured with a CMK (`executeCommandConfiguration.kmsKeyId`); if you enable that, re-add it scoped
+to **that key ARN** with a `kms:ViaService` condition — never back to `"*"`.
+
+## Attaching your own policies: `ecs_task_role_name`
+
+The module outputs `ecs_task_role_arn` and, since 2026-09-18, `ecs_task_role_name`. Use the **name**
+with `aws_iam_role_policy_attachment`; without it a caller had to hardcode the role name, which is
+why an assets-bucket policy once shipped created-but-attached-to-nothing.
+
+```terraform
+resource "aws_iam_role_policy_attachment" "app" {
+  role       = module.ecs.ecs_task_role_name
+  policy_arn = aws_iam_policy.app.arn
+}
+```
+
+## `desired_count` is owned by autoscaling
+
+`aws_ecs_service.lifecycle.ignore_changes` includes `desired_count`. If you register an
+`aws_appautoscaling_target` against this service — the `cloudwatch_alarm_ecs` module does — then
+Application Auto Scaling owns that field. Without this, every apply resets the service to
+`var.desired_task_count`, **including mid scale-out**, removing capacity during the load event that
+caused it, and "plan is clean" stops being a truthful convergence signal.
+
+`desired_task_count` therefore sets only the INITIAL count.
 
 ## Required Variables
 

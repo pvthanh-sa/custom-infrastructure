@@ -37,6 +37,14 @@ output "ecs_task_role_arn" {
   value = module.ecs_task_role.iam_role_arn
 }
 
+# Callers need the NAME (not the ARN) to attach their own policies with
+# aws_iam_role_policy_attachment. Without this the only options were hardcoding the role name or
+# leaving app permissions unattached — which is what happened to the assets-bucket policy.
+output "ecs_task_role_name" {
+  description = "Name of the ECS task role, for attaching caller-owned policies."
+  value       = module.ecs_task_role.iam_role_name
+}
+
 output "ecs_task_execution_role_arn" {
   value = module.ecs_task_execution_role.iam_role_arn
 }

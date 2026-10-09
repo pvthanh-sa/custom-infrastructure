@@ -4,6 +4,10 @@ locals {
   # Create the basic-auth CloudFront Function only when auth is actually used — by the default
   # cache behavior or by any ordered cache behavior. Prevents an orphan function when auth is off.
   create_auth_function = var.enable_default_auth || anytrue([for b in var.cache_behaviors : b.enable_auth])
+
+  # Deprecated alias resolution, in ONE place. forwarded_headers feeds the ORIGIN REQUEST policy
+  # only; it can never reach the cache key. null on both -> allViewer.
+  origin_request_headers = var.origin_request_headers != null ? var.origin_request_headers : var.forwarded_headers
 }
 
 # VPC origin — lets CloudFront reach a PRIVATE (internal) ALB through AWS-managed ENIs inside the
@@ -201,6 +205,25 @@ resource "aws_cloudfront_cache_policy" "main" {
   max_ttl     = var.max_ttl
   min_ttl     = var.min_ttl
 
+  # Upgrading across the forwarded_headers split must not silently narrow anyone's cache key.
+  # Before the split this module keyed on five headers by default; after it, an unset value would
+  # mean "none". A consumer is not allowed to inherit that change — they decide once, explicitly.
+  #
+  # A lifecycle.precondition rather than a variable validation because a validation block cannot
+  # read another variable below Terraform 1.9, and this module supports older callers. A
+  # precondition needs 1.2, which costs nothing here: versions.tf already floors this module at
+  # 1.4.0 for the two-argument optional() in variables.tf, so the precondition adds no requirement
+  # a caller does not already meet.
+  #
+  # This fires only when the module actually builds the cache policy. A caller passing
+  # cache_policy_id skips the resource entirely (count = 0 above) and is never asked.
+  lifecycle {
+    precondition {
+      condition     = var.cache_key_headers != null
+      error_message = "cache_key_headers must be set explicitly. This module used to key the cache on five headers by default; leaving it unset after the forwarded_headers split would silently narrow your cache key to 'none'. Choose: [] for no headers in the key (usually right), or name the headers that genuinely vary the response. To keep the old behaviour exactly, pass [\"Host\", \"CloudFront-Forwarded-Proto\", \"CloudFront-Is-Desktop-Viewer\", \"CloudFront-Is-Mobile-Viewer\", \"CloudFront-Is-Tablet-Viewer\"]. NEVER put a credential (Authorization, Cookie) here."
+    }
+  }
+
   parameters_in_cache_key_and_forwarded_to_origin {
     enable_accept_encoding_brotli = true
     enable_accept_encoding_gzip   = true
@@ -209,12 +232,15 @@ resource "aws_cloudfront_cache_policy" "main" {
       query_string_behavior = "all"
     }
 
+    # CACHE KEY. Driven by cache_key_headers alone — forwarded_headers can no longer reach here,
+    # which is the whole point of the split: a credential in this list gives every token its own
+    # cache entry and then serves an authenticated response from the edge for up to max_ttl.
     headers_config {
-      header_behavior = var.forwarded_headers != null && length(var.forwarded_headers) > 0 ? "whitelist" : "none"
+      header_behavior = length(coalesce(var.cache_key_headers, [])) > 0 ? "whitelist" : "none"
       dynamic "headers" {
-        for_each = var.forwarded_headers != null && length(var.forwarded_headers) > 0 ? [1] : []
+        for_each = length(coalesce(var.cache_key_headers, [])) > 0 ? [1] : []
         content {
-          items = var.forwarded_headers
+          items = var.cache_key_headers
         }
       }
     }
@@ -236,12 +262,14 @@ resource "aws_cloudfront_origin_request_policy" "main" {
     cookie_behavior = "all"
   }
 
+  # ORIGIN FORWARDING. Defaults to allViewer so a header the origin needs is never silently
+  # withheld; an explicit list withholds on purpose.
   headers_config {
-    header_behavior = var.forwarded_headers != null && length(var.forwarded_headers) > 0 ? "whitelist" : "allViewer"
+    header_behavior = local.origin_request_headers != null && length(local.origin_request_headers) > 0 ? "whitelist" : "allViewer"
     dynamic "headers" {
-      for_each = var.forwarded_headers != null && length(var.forwarded_headers) > 0 ? [1] : []
+      for_each = local.origin_request_headers != null && length(local.origin_request_headers) > 0 ? [1] : []
       content {
-        items = var.forwarded_headers
+        items = local.origin_request_headers
       }
     }
   }

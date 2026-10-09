@@ -2,6 +2,50 @@
 
 Terraform module which creates Application Load Balancer resources on AWS.
 
+> ## 🚨 UPGRADE NOTE — 2026-09-24. Two breaking changes. Read before you plan.
+>
+> ### 1. Your NEXT APPLY REPLACES THE SECURITY GROUP. Every consumer, no exception.
+>
+> `aws_security_group.security_group` moved from a fixed `name` to `name_prefix`. `name` is ForceNew
+> in the EC2 API, so this one change replaces the SG. Expect, in your plan:
+>
+> - `aws_security_group.security_group` **replaced** (created first — `create_before_destroy`)
+> - `aws_lb.alb` **updated in place** to point at the new SG id
+> - any rule you declared elsewhere that *references* this SG id **recreated**
+>
+> There is a **brief window during the swap in which the new SG carries no ingress yet.** In-flight
+> connections survive; new ones may be refused for a few seconds. Plan it like a change, not a
+> no-op.
+>
+> Why it had to happen now, and not later: a fixed `name` together with `create_before_destroy`
+> means *any* future ForceNew change (adding a resource-level `description`, for instance) deadlocks
+> on `InvalidGroup.Duplicate` — both SGs exist at once under the same name — and the only way out is
+> `terraform untaint`. We hit exactly that on 2026-09-17. Shipping the trap and the fix in separate
+> releases would have handed the deadlock to whoever changed the SG next. The `Name` **tag** is
+> still pinned to `${var.app_name}-alb`, so the console and your scripts find it the same way.
+>
+> ### 2. `test_listener_source_ips` FAILS CLOSED. The VPC-CIDR fallback is gone.
+>
+> The `:10443` blue/green test listener used to fall back to **every CIDR associated with the VPC**
+> when the caller named no source. That fallback was the defect — a module default that grants
+> access — and it is removed. **Empty now means no `:10443` ingress at all.**
+>
+> If you never set this variable, you are relying on the old fallback and **you lose test-listener
+> reachability on upgrade**: CodeDeploy blue/green still deploys, but nothing can reach the green
+> target group on `:10443` to validate it. Set `test_listener_source_ips` to the sources that
+> genuinely need it.
+>
+> This port is not an inert stub: its listener rule forwards `path_pattern ["*"]` to the green
+> target group, so anything allowed here reaches the whole application, unauthenticated, during
+> every deployment — bypassing CloudFront, WAF and any edge auth.
+>
+> ### Also new (additive, nothing breaks)
+>
+> `ingress_source_security_group_ids` — grant `:443` from source security groups, for in-VPC callers
+> whose address is not worth expressing as a CIDR. It has to be declared in-line inside the SG
+> resource, because the AWS provider does not support mixing in-line ingress blocks with standalone
+> `aws_security_group_rule` resources: the in-line set silently strips them on every apply.
+
 > ⚠️ **When this ALB is a CloudFront origin: Origin mTLS is MANDATORY.** The HTTPS listener MUST run
 > `mutual_authentication { mode = "verify" }` against a trust store (CA bundle in S3) so only your
 > CloudFront distribution — presenting its client certificate — can connect. A CloudFront **prefix
@@ -61,7 +105,9 @@ module "alb_public" {
   app_name = "${var.environment}-${var.app_name}-public"
   vpc_id   = module.network.vpc_id
 
-  restricted_source_ips = ["0.0.0.0/0"]  # Allow all internet traffic
+  # NOTE: a /0 is REJECTED by this module's validation. An internet-facing ALB must name the
+  # sources deliberately, or sit behind CloudFront (allow_cloudfront_prefix_list = true).
+  restricted_source_ips = ["203.0.113.0/24"] # example: your egress ranges
 
   subnet_ids          = [for subnet in data.aws_subnet.public_subnets : subnet.id]
   alb_internal        = false
@@ -115,10 +161,46 @@ module "alb_with_cloudfront" {
 
 | Option                                   | Description                                |
 | ---------------------------------------- | ------------------------------------------ |
-| `restricted_source_ips = ["0.0.0.0/0"]`  | Allow all internet traffic                 |
+| `restricted_source_ips = ["0.0.0.0/0"]`  | ❌ **REJECTED** by validation — see the note below |
 | `restricted_source_ips = ["10.0.0.0/8"]` | Allow only internal VPC traffic            |
 | `allow_cloudfront_prefix_list = true`    | Allow traffic only from CloudFront         |
 | `create_route53_record = false`          | Skip Route53 record (for CloudFront setup) |
+
+## ⚠️ BREAKING CHANGE — the :10443 test listener now fails closed
+
+**Before:** `test_listener_source_ips` did not exist, and the :10443 blue/green test listener took
+ingress from **every CIDR associated with the VPC**.
+
+**Now:** `test_listener_source_ips` defaults to `[]`, which means **no :10443 ingress at all**.
+
+**What a consumer must do:** if you use blue/green and need to reach the test listener, name the
+sources — `test_listener_source_ips = ["10.0.1.0/24"]`. If you do nothing, the listener still
+exists and CodeDeploy keeps working; only the security-group ingress is gone.
+
+**Why:** the test listener is not a spare debug port. The consuming stack points a listener rule
+with `path_pattern ["*"]` at the green target group, so every source allowed on :10443 reaches the
+**entire application, unauthenticated**, during every blue/green shift — bypassing CloudFront, WAF
+and any edge authentication. A module default must never grant that; the consumer says where from.
+
+## Granting ingress from a security group
+
+`ingress_source_security_group_ids` lets an in-VPC caller reach the production listener without
+inventing a CIDR for it — a Fargate task in another subnet calling this ALB server-side, for example.
+
+```terraform
+ingress_source_security_group_ids = [aws_security_group.app.id]
+```
+
+It is declared **in-line inside the module's security group**, not as a separate
+`aws_security_group_rule`, and that is not a style choice: the AWS provider does not support mixing
+in-line rules with standalone rules on the same group. Applying the in-line set **removes** whatever
+a standalone rule added, so a rule attached from outside is stripped on every apply and re-added by
+every plan — a stack that never converges.
+
+`restricted_source_ips` may be empty **only** if this is non-empty (or
+`allow_cloudfront_prefix_list = true`). At least one source must be able to reach the production
+port; a security group with no ingress at all is not a locked-down ALB, it is an unreachable one.
+That is enforced by a `lifecycle.precondition`, so it fails at plan, not at apply.
 
 ## Listeners Created
 
@@ -146,6 +228,11 @@ module "alb_with_cloudfront" {
 
 > **Note:** When `create_route53_record = false` (e.g., using CloudFront), both `route_53_zone_id` and `alb_domain` become optional and can be omitted.
 
+| `ingress_source_security_group_ids` | Security groups allowed to reach the production listener. Lets `restricted_source_ips` be empty. | `list(string)` | `[]` | no |
+| `test_listener_source_ips` | CIDRs allowed on the :10443 blue/green test listener. **`[]` = no ingress (fail closed)** — see the BREAKING CHANGE section. | `list(string)` | `[]` | no |
+| `enable_test_listener` | Create the :10443 test listener at all. Keep `true` for blue/green — CodeDeploy references its ARN. | `bool` | `true` | no |
+| `ssl_policy` | TLS policy for the HTTPS listeners. Must be TLS 1.2+; legacy policies are rejected. | `string` | `ELBSecurityPolicy-TLS13-1-2-2021-06` | no |
+| `access_logs_bucket` | S3 bucket for ALB access logs. Empty = disabled. | `string` | `""` | no |
 ## Outputs
 
 | Name                          | Description                           |

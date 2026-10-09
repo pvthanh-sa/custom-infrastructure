@@ -373,7 +373,13 @@ resource "aws_ecs_service" "ecs_service" {
   lifecycle {
     ignore_changes = [
       load_balancer,
-      task_definition
+      task_definition,
+      # Application Auto Scaling owns desired_count once an appautoscaling_target is registered
+      # against this service (cloudwatch_alarm_ecs does exactly that). Without this, every apply
+      # resets the service to var.desired_task_count — including mid scale-out, removing capacity
+      # during the load event that caused it — and `plan is clean` stops being a truthful
+      # convergence signal. Added 2026-09-18 (G4).
+      desired_count
     ]
   }
   tags = merge(
