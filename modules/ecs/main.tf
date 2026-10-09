@@ -349,6 +349,15 @@ resource "aws_security_group_rule" "ecs_allow_alb" {
   security_group_id        = var.ecs_security_group_id
   source_security_group_id = var.alb_security_group_id
   description              = "Allow inbound traffic from ALB to ECS tasks"
+
+  # Create the replacement BEFORE deleting this rule. It is replaced whenever the ALB security group
+  # is (its source changes), and the default destroy-before-create left the tasks with NO ingress from
+  # the ALB between the delete and the create: measured ~3 s per service on a real SG replacement
+  # (2026-10-09), during which every NEW ALB -> task connection is dropped and the ALB answers 504.
+  # The old and new rules differ by source security group, so both can exist at once.
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_ecs_service" "ecs_service" {
