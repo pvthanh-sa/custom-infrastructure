@@ -216,7 +216,7 @@ variable "logging_prefix" {
 
 # IPv6 support
 variable "enable_ipv6" {
-  description = "Enable IPv6 support"
+  description = "Enable IPv6 on the distribution (is_ipv6_enabled) and publish the AAAA alias record. Both follow this one switch."
   type        = bool
   default     = true
 }
