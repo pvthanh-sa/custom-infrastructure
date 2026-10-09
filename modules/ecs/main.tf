@@ -95,19 +95,26 @@ resource "aws_ecs_task_definition" "task_definition" {
   }
 
   container_definitions = templatefile("${path.module}/container_definitions/server-task-def.json.tpl", {
-    container_name    = var.container_names[0]
-    container_port    = var.container_port
-    repository_url    = var.repository_url
-    memory_size       = var.task_memory_size
-    app_name          = var.app_name
-    aws_region        = var.region
-    health_check_path = var.app_health_check_path
+    container_name      = var.container_names[0]
+    container_port      = var.container_port
+    repository_url      = var.repository_url
+    bootstrap_image_tag = var.bootstrap_image_tag
+    memory_size         = var.task_memory_size
+    app_name            = var.app_name
+    aws_region          = var.region
+    health_check_path   = var.app_health_check_path
 
     # Environment variables
     }
   )
   execution_role_arn = module.ecs_task_execution_role.iam_role_arn
   task_role_arn      = module.ecs_task_role.iam_role_arn
+
+  # Writable scratch space for a read-only root filesystem (the container mounts it at /tmp).
+  # Fargate backs a volume with no host path by task ephemeral storage.
+  volume {
+    name = "tmp"
+  }
 
   tags = merge(
     var.tags,
@@ -139,6 +146,8 @@ resource "aws_lb_target_group" "target_group_blue" {
   protocol    = var.load_balancer_type == "nlb" ? "TCP" : "HTTP"
   target_type = "ip"
 
+  deregistration_delay = var.deregistration_delay
+
   health_check {
     port                = var.container_port
     timeout             = var.load_balancer_type == "nlb" ? 6 : 10
@@ -168,6 +177,8 @@ resource "aws_lb_target_group" "target_group_green" {
   port        = var.container_port
   protocol    = var.load_balancer_type == "nlb" ? "TCP" : "HTTP"
   target_type = "ip"
+
+  deregistration_delay = var.deregistration_delay
 
   health_check {
     port                = var.container_port
@@ -346,7 +357,7 @@ resource "aws_ecs_service" "ecs_service" {
   desired_count          = var.desired_task_count
   cluster                = var.cluster_name
   task_definition        = aws_ecs_task_definition.task_definition.arn
-  enable_execute_command = true
+  enable_execute_command = var.enable_execute_command
 
   network_configuration {
     security_groups  = [var.ecs_security_group_id]

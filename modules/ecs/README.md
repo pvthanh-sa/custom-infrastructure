@@ -309,6 +309,52 @@ caused it, and "plan is clean" stops being a truthful convergence signal.
 
 `desired_task_count` therefore sets only the INITIAL count.
 
+## ⚠️ BREAKING CHANGE — the bootstrap task definition, and a required `bootstrap_image_tag`
+
+This module registers a **bootstrap** task definition. The service ignores `task_definition`, so
+CI/CD registers the real revisions; the bootstrap one runs only when the service is first created,
+and it is the revision the CodeDeploy module's S3 appspec (`create_deployment_script`) points at.
+It used to describe an image nobody deploys: `command ["node","dist/main"]`, a `curl` health check,
+image `:latest`, root user, writable root filesystem.
+
+**Now:**
+
+| Field | Before | Now |
+|-------|--------|-----|
+| image | `<repo>:latest` | `<repo>:${var.bootstrap_image_tag}` — **required, no default, `latest` rejected** |
+| `command` | `["node","dist/main"]` | none — the image's own `CMD` |
+| health check | `curl -f http://localhost:<port><path>` | `wget -q -T 4 -O /dev/null http://127.0.0.1:<port><path>` (interval 10, timeout 5, retries 10, startPeriod 10) |
+| `user` | (image default, often root) | `1000:1000` |
+| root filesystem | writable | `readonlyRootFilesystem = true`, task volume `tmp` mounted at `/tmp` |
+| `stopTimeout` | ECS default (30) | `30`, explicit |
+
+**What a consumer must do:**
+
+1. Set `bootstrap_image_tag`. A tag that is never pushed (e.g. `"bootstrap"`) is a good choice: until
+   CI deploys, a task fails with `CannotPullContainerError` — a clear signal — instead of silently
+   pulling a mutable tag. Do not point it at `latest`.
+2. Check that your image fits the template's **assumptions**: BusyBox `wget` on the PATH (Alpine
+   images have it; Debian-slim does not, and `curl` is gone), a user with **UID 1000**, and writes
+   **only under `/tmp`**. If you deploy with the S3 appspec + `create_deployment_script`, the bootstrap
+   revision is what runs — an image that breaks an assumption fails its health check and CodeDeploy
+   rolls back (loud, not silent). If you register your own task definitions from CI, nothing running
+   changes: Terraform registers a new bootstrap revision and deregisters the previous bootstrap one.
+
+## ECS Exec: `enable_execute_command`
+
+Was hardcoded `true`. Now a variable, **default `true`** so upgrading changes nothing. Set `false`
+when the container runs a read-only root filesystem (an exec session can do very little) or when no
+session logging is configured. With a `CODE_DEPLOY` controller the flag flips on the service without
+a deployment and takes effect for tasks started by the next deployment.
+
+## Target-group draining: `deregistration_delay`
+
+Was unset, so both target groups used the AWS default of **300 s** — every scale-in and every
+blue/green termination drained for five minutes. Now a variable, **default 300** (unchanged
+behaviour), validated 0–3600. Size it against the ALB `idle_timeout`: a value ≥ the idle timeout
+lets the ALB close every keep-alive connection it holds before ECS sends SIGTERM, so 60 is a good
+choice behind an ALB at the default idle timeout of 60.
+
 ## Required Variables
 
 | Variable | Type | Description |
@@ -326,6 +372,7 @@ caused it, and "plan is clean" stops being a truthful convergence signal.
 | `ecs_security_group_id` | string | Security group ID for ECS tasks |
 | `repository_url` | string | ECR repository URL |
 | `repository_arn` | string | ECR repository ARN |
+| `bootstrap_image_tag` | string | Image tag of the **bootstrap** task definition only. No default; `latest` rejected. See the breaking-change section |
 
 ## Optional Variables
 
@@ -337,6 +384,8 @@ caused it, and "plan is clean" stops being a truthful convergence signal.
 | `app_health_check_path` | string | `/health` | Health check endpoint |
 | `load_balancer_type` | string | `"alb"` | Load balancer type (`alb` or `nlb`) |
 | `cpu_architecture` | string | `"X86_64"` | Fargate CPU architecture (`X86_64` or `ARM64`). ARM64 (Graviton) is ~20% cheaper — image must match |
+| `enable_execute_command` | bool | `true` | ECS Exec on the service |
+| `deregistration_delay` | number | `300` | Seconds a target drains before ECS sends SIGTERM (0–3600) |
 | `cloudwatch_log_retention_in_days` | number | 30 | Days to retain ECS CloudWatch logs (1–3653) |
 | `create_app_secret` | bool | `false` | Create the single `<app_name>-secrets` container (see the "Secrets" section) |
 | `secret_arns` | list(string) | `[]` | Extra externally-managed secret ARNs the execution role may read |
