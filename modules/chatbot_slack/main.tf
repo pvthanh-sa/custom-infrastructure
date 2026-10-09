@@ -1,5 +1,6 @@
 locals {
-  readonly_policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+  # Attached to the channel role AND used as its guardrail. See var.read_policy_arn.
+  readonly_policy_arn = var.read_policy_arn
 }
 
 resource "awscc_chatbot_slack_channel_configuration" "this" {
@@ -14,6 +15,10 @@ resource "awscc_chatbot_slack_channel_configuration" "this" {
     local.readonly_policy_arn
   ]
   sns_topic_arns = [aws_sns_topic.chatbot.arn]
+
+  # null leaves the attribute unset, so AWS keeps its own default (false / NONE).
+  user_role_required = var.user_authorization_required
+  logging_level      = var.logging_level
 
   tags = [
     for k, v in merge(var.tags, { Name = "${var.app_name}-${var.slack_channel_name}-chatbot-slack" }) :
@@ -67,13 +72,17 @@ data "aws_iam_policy_document" "chatbot" {
     resources = ["*"]
   }
 
-  statement {
-    effect = "Allow"
-    actions = [
-      "lambda:invokeAsync",
-      "lambda:invokeFunction"
-    ]
-    resources = ["*"]
+  # Invoke-any-Lambda from Slack. Off unless asked for; see var.allow_lambda_invoke.
+  dynamic "statement" {
+    for_each = var.allow_lambda_invoke ? [1] : []
+    content {
+      effect = "Allow"
+      actions = [
+        "lambda:invokeAsync",
+        "lambda:invokeFunction"
+      ]
+      resources = ["*"]
+    }
   }
 }
 
